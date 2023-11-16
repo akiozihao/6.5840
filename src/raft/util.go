@@ -12,6 +12,7 @@ import (
 type logTopic string
 
 const (
+	dCandidate  logTopic = "CAND"
 	dClient  logTopic = "CLNT"
 	dCommit  logTopic = "CMIT"
 	dDrop    logTopic = "DROP"
