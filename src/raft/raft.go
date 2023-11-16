@@ -19,13 +19,16 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -126,6 +129,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -146,6 +156,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []Entry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic(fmt.Sprintf("S%d readPersist error!", rf.me))
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -188,6 +212,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// 2C optimized
+	FirstIndex int
 }
 
 // example RequestVote RPC handler.
@@ -244,12 +271,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.role = FOLLOWER
 		rf.votedFor = -1
+		rf.persist()
 	}
 	reply.Term = rf.currentTerm
 	// reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm
 	entry, exist := rf.getByIndex(args.PrevLogIndex)
 	if !exist || entry.Term != args.PrevLogTerm {
+		if !exist {
+			reply.FirstIndex = -1
+		} else {
+			// entry.Term != args.PrevLogTerm
+			conflictTerm := entry.Term
+			j := args.PrevLogIndex
+			for {
+				t, exist := rf.getByIndex(j)
+				if !exist {
+					panic("getByIndex error!")
+				}
+				if t.Term != conflictTerm {
+					break
+				}
+				j--
+			}
+			reply.FirstIndex = j + 1
+		}
+		Debug(dLog2, "S%d firstIndex %d, lenlog = %d,prevLogIndex = %d", rf.me, reply.FirstIndex, len(rf.log), args.PrevLogIndex)
 		reply.Success = false
 		return
 	}
@@ -278,6 +325,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.applyCond.Signal()
 		}
 	}
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -344,6 +392,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Command: command,
 	}
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	term = rf.getLastLogTerm()
 	index = rf.getLastLogIndex()
 	Debug(dLeader, "S%d add log %v, index %d", rf.me, entry, index)
@@ -383,7 +432,7 @@ func (rf *Raft) ticker() {
 		rf.currentTerm++
 		rf.votedFor = rf.me
 		rf.resetElectionTimer()
-
+		rf.persist()
 		// state
 		term := rf.currentTerm
 		lastLogIndex := rf.getLastLogIndex()
@@ -424,6 +473,7 @@ func (rf *Raft) ticker() {
 					rf.currentTerm = reply.Term
 					rf.role = FOLLOWER
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -434,6 +484,7 @@ func (rf *Raft) ticker() {
 						rf.role = LEADER
 						rf.resetMatchIndex()
 						rf.resetNextIndex()
+						rf.persist()
 						Debug(dVote, "S%d become leader", rf.me)
 					}
 				}
@@ -480,7 +531,8 @@ func (rf *Raft) heartBeat() {
 				args.PrevLogIndex = rf.nextIndex[i] - 1
 				entry, exist := rf.getByIndex(args.PrevLogIndex)
 				if !exist {
-					panic(fmt.Sprintf("S%d entry not exist, index = %d", rf.me, args.PrevLogIndex))
+					Debug(dLog2, "S%d entry not exist, index = %d, lenlog = %d", rf.me, args.PrevLogIndex, len(rf.log))
+					panic(fmt.Sprintf("S%d entry not exist, index = %d, lenlog = %d", rf.me, args.PrevLogIndex, len(rf.log)))
 				}
 				args.PrevLogTerm = entry.Term
 				args.LeaderCommit = rf.commitIndex
@@ -494,10 +546,15 @@ func (rf *Raft) heartBeat() {
 				}
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+
+				if reply.Term < rf.currentTerm {
+					return
+				}
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.role = FOLLOWER
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -508,9 +565,8 @@ func (rf *Raft) heartBeat() {
 
 				if reply.Success {
 					if len(args.Entries) > 0 {
-						rf.nextIndex[i] += len(args.Entries)
+						rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
-
 						// if there exist an N such that N > commitIndex, a majority
 						// of matchIndex[i] >= N, and log[N].term == currentTerm
 						// set commitIndex = N
@@ -536,10 +592,26 @@ func (rf *Raft) heartBeat() {
 						}
 					}
 				} else {
-					rf.nextIndex[i]--
-					Debug(dTest, "S%d nextIndex[%d]--", rf.me, i)
-				}
+					// rf.nextIndex[i]--
+					old := rf.nextIndex[i]
 
+					if reply.FirstIndex == -1 {
+						j := args.PrevLogIndex
+						for {
+							t, _ := rf.getByIndex(j)
+							if t.Term != args.PrevLogTerm {
+								break
+							}
+							j--
+						}
+						rf.nextIndex[i] = int(math.Min(float64(rf.nextIndex[i]), float64(j+1)))
+					} else {
+						rf.nextIndex[i] = int(math.Min(float64(reply.FirstIndex), float64(rf.nextIndex[i])))
+					}
+					Debug(dLog2, "S%d rf.nextIndex[%d] %d -> %d", rf.me, i, old, rf.nextIndex[i])
+					// Debug(dTest, "S%d nextIndex[%d]--", rf.me, i)
+				}
+				rf.persist()
 			}()
 		}
 	}
@@ -638,7 +710,7 @@ func (rf *Raft) getByIndex(idx int) (entry Entry, exist bool) {
 
 // get Entries which index >= idx
 func (rf *Raft) getFromIndex(idx int) (res []Entry) {
-	// use res = rf.log[idx:]  data race 
+	// use res = rf.log[idx:]  data race
 	res = make([]Entry, 0)
 	res = append(res, rf.log[idx:]...)
 	return
