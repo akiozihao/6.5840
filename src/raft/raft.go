@@ -103,6 +103,11 @@ type Raft struct {
 	// apply
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
+
+	// for snapshot
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	snapShot          []byte
 }
 
 // return currentTerm and whether this server
@@ -134,6 +139,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	raftState := w.Bytes()
 	rf.persister.Save(raftState, nil)
 }
@@ -161,14 +168,20 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []Entry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		panic(fmt.Sprintf("S%d readPersist error!", rf.me))
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -683,6 +696,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
+
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
+	rf.snapShot = persister.ReadSnapshot()
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
