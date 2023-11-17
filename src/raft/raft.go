@@ -576,6 +576,14 @@ func (rf *Raft) heartBeat() {
 								if i == rf.me {
 									continue
 								}
+								entry, exist := rf.getByIndex(N)
+								if !exist {
+									panic("not exist")
+								}
+								// fix figure-8 5.4.2
+								if entry.Term != rf.currentTerm {
+									break
+								}
 								if rf.matchIndex[i] >= N {
 									cnt++
 									if cnt > len(rf.peers)/2 && cnt-1 <= len(rf.peers)/2 {
