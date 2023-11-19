@@ -108,6 +108,7 @@ type Raft struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	snapShot          []byte
+	installMsg        ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -182,6 +183,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = log
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
+		rf.lastApplied = lastIncludedIndex
+		rf.commitIndex = lastIncludedIndex
 	}
 }
 
@@ -212,6 +215,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if len(rf.log.Log) > 0 {
 		Debug(dSnap, "S%d snapshots to %d log[%d - %d]", rf.me, index, rf.log.Index0, rf.log.lastIndex())
 	}
+}
+
+func (rf *Raft) SnapShotPersist() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, rf.snapShot)
 }
 
 // example RequestVote RPC arguments structure.
@@ -251,9 +266,55 @@ type AppendEntriesReply struct {
 }
 
 type InstallSnapShotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
 }
 
 type InstallSnapShotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapShot(args *InstallSnapShotArgs, reply *InstallSnapShotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+	rf.resetElectionTimer()
+	if args.Term > rf.currentTerm {
+		rf.role = FOLLOWER
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+	}
+	reply.Term = rf.currentTerm
+	rf.snapShot = args.Data
+	// if existing log entry has same index and term as snapshot's
+	// last include entry,retain log entries following it and reply
+	if rf.log.lastIndex() >= args.LastIncludedIndex && rf.log.entry(args.LastIncludedIndex).Term == args.LastIncludedTerm {
+		rf.log.cutStart(args.LastIncludedIndex - rf.log.Index0)
+	} else {
+		// discard the entire log
+		rf.log = mkLog([]Entry{{args.LastIncludedTerm, nil}}, args.LastIncludedIndex)
+	}
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	applyMsh := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapShot,
+		SnapshotTerm:  rf.lastIncludedTerm,
+		SnapshotIndex: rf.lastIncludedIndex,
+	}
+	rf.installMsg = applyMsh
+	rf.applyCond.Signal()
+	Debug(dSnap, "S%d applyMsg.SnapshotIndex = %d, SnapshotTerm = %d", rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
+	rf.SnapShotPersist()
 }
 
 // example RequestVote RPC handler.
@@ -324,7 +385,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// entry.Term != args.PrevLogTerm
 		conflictTerm := rf.log.entry(args.PrevLogIndex).Term
 		j := args.PrevLogIndex
-		for j >= rf.log.start() {
+		for j > rf.log.start() {
 			t := rf.log.entry(j)
 			if t.Term != conflictTerm {
 				break
@@ -397,6 +458,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapShot(server int, args *InstallSnapShotArgs, reply *InstallSnapShotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapShot", args, reply)
 	return ok
 }
 
@@ -558,17 +624,59 @@ func (rf *Raft) heartBeat() {
 					LeaderCommit: rf.commitIndex,
 				}
 				reply := &AppendEntriesReply{}
+				if rf.nextIndex[i] <= rf.log.start() {
+					term := rf.currentTerm
+					lastIncludeIndex := rf.lastIncludedIndex
+					lastIncludeTerm := rf.lastIncludedTerm
+					args := &InstallSnapShotArgs{
+						Term:              term,
+						LeaderId:          rf.me,
+						LastIncludedIndex: lastIncludeIndex,
+						LastIncludedTerm:  lastIncludeTerm,
+						Data:              rf.snapShot,
+					}
+					reply := &InstallSnapShotReply{}
+					rf.mu.Unlock()
+					Debug(dSnap, "S%d -> S%d, args.LastIncludedIndex = %d, args.lastIncludedTerm = %d,log = %v", rf.me, i, args.LastIncludedIndex, args.LastIncludedTerm, rf.log)
+					ok := rf.sendInstallSnapShot(i, args, reply)
+					if !ok {
+						return
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = FOLLOWER
+						rf.votedFor = -1
+						rf.persist()
+						return
+					}
+					if rf.currentTerm != term {
+						return
+					}
+					if args.LastIncludedIndex+1 > rf.nextIndex[i] {
+						rf.nextIndex[i] = args.LastIncludedIndex + 1
+					}
+					rf.matchIndex[i] = rf.nextIndex[i] - 1
+					Debug(dSnap, "S%d -> S%d, nextIndex[i] = %d, matchIndex[i] = %d", rf.me, i, rf.nextIndex[i], rf.matchIndex[i])
 
+					return
+				}
 				//  if last log index >= nextIndex for a follower: send
 				// AppendEntries RPC with log entries starting at nextIndex
 				if rf.log.lastIndex() >= rf.nextIndex[i] {
 					t := rf.log.slice(rf.nextIndex[i])
 					args.Entries = make([]Entry, len(t))
 					copy(args.Entries, t)
+
+					args.PrevLogIndex = rf.nextIndex[i] - 1
+					args.PrevLogTerm = rf.log.entry(args.PrevLogIndex).Term
+					Debug(dLeader, "S%d send log to S%d, nextIndex[i] = %d,args = %v, rf.log = %v", rf.me, i, rf.nextIndex[i], args, rf.log)
+
+				} else {
+					args.PrevLogIndex = rf.log.lastIndex()
+					args.PrevLogTerm = rf.log.lastEntry().Term
 				}
-				args.PrevLogIndex = rf.nextIndex[i] - 1
-				args.PrevLogTerm = rf.log.entry(args.PrevLogIndex).Term
-				Debug(dLeader, "S%d send log to S%d, log = %v", rf.me, i, args.Entries)
 
 				rf.mu.Unlock()
 
@@ -673,9 +781,6 @@ func (rf *Raft) applier() {
 			for rf.lastApplied < rf.commitIndex {
 
 				rf.lastApplied++
-				if rf.log.Index0 != 0 && rf.lastApplied-rf.log.Index0 < 0 {
-					fmt.Println("zz")
-				}
 				entry := rf.log.entry(rf.lastApplied)
 				msg := ApplyMsg{
 					CommandValid: true,
@@ -687,6 +792,11 @@ func (rf *Raft) applier() {
 				rf.mu.Lock()
 				Debug(dLog, "S%d apply msg %v", rf.me, msg)
 			}
+		} else if len(rf.installMsg.Snapshot) > 0 {
+			rf.mu.Unlock()
+			rf.applyCh <- rf.installMsg
+			rf.mu.Lock()
+			rf.installMsg = ApplyMsg{}
 		} else {
 			rf.applyCond.Wait()
 		}
