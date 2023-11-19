@@ -142,7 +142,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(raftState, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -191,7 +191,27 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.lastIncludedIndex {
+		return
+	}
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log.entry(index).Term
+	rf.log.cutStart(index - rf.log.Index0)
+	rf.snapShot = snapshot
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, snapshot)
+	if len(rf.log.Log) > 0 {
+		Debug(dSnap, "S%d snapshots to %d log[%d - %d]", rf.me, index, rf.log.Index0, rf.log.lastIndex())
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -228,6 +248,12 @@ type AppendEntriesReply struct {
 
 	// 2C optimized
 	FirstIndex int
+}
+
+type InstallSnapShotArgs struct {
+}
+
+type InstallSnapShotReply struct {
 }
 
 // example RequestVote RPC handler.
@@ -645,7 +671,11 @@ func (rf *Raft) applier() {
 		if rf.lastApplied < rf.commitIndex {
 			Debug(dLog, "S%d start apply", rf.me)
 			for rf.lastApplied < rf.commitIndex {
+
 				rf.lastApplied++
+				if rf.log.Index0 != 0 && rf.lastApplied-rf.log.Index0 < 0 {
+					fmt.Println("zz")
+				}
 				entry := rf.log.entry(rf.lastApplied)
 				msg := ApplyMsg{
 					CommandValid: true,
@@ -701,7 +731,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.snapShot = persister.ReadSnapshot()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartBeat()
