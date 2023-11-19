@@ -578,8 +578,17 @@ func (rf *Raft) heartBeat() {
 
 				if reply.Success {
 					if len(args.Entries) > 0 {
-						rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
+						// rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
+						// rf.matchIndex[i] = rf.nextIndex[i] - 1
+
+						newNext := args.PrevLogIndex + len(args.Entries) + 1
+						newMatch := args.PrevLogIndex + len(args.Entries)
+						if newNext > rf.nextIndex[i] {
+							rf.nextIndex[i] = newNext
+						}
+						if newMatch > rf.matchIndex[i] {
+							rf.matchIndex[i] = newMatch
+						}
 						// if there exist an N such that N > commitIndex, a majority
 						// of matchIndex[i] >= N, and log[N].term == currentTerm
 						// set commitIndex = N
@@ -655,8 +664,9 @@ func (rf *Raft) applier() {
 					Command:      entry.Command,
 					CommandIndex: rf.lastApplied,
 				}
-
+				rf.mu.Unlock()
 				rf.applyCh <- msg
+				rf.mu.Lock()
 				Debug(dLog, "S%d apply msg %v", rf.me, msg)
 			}
 		} else {
