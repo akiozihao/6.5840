@@ -85,7 +85,7 @@ type Raft struct {
 	// persistent state
 	currentTerm int
 	votedFor    int
-	log         []Entry
+	log         Log
 
 	// volatile state on all servers
 	commitIndex int
@@ -167,7 +167,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
-	var log []Entry
+	var log Log
 	var lastIncludedIndex int
 	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
@@ -254,8 +254,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// if voteFor is null or candidateId
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// candidate's log is at least as up-to-date as receivers'log
-		if rf.getLastLogTerm() < args.LastLogTerm ||
-			(rf.getLastLogTerm() == args.LastLogTerm && rf.getLastLogIndex() <= args.LastLogIndex) {
+		if rf.log.lastEntry().Term < args.LastLogTerm ||
+			(rf.log.lastEntry().Term == args.LastLogTerm && rf.log.lastIndex() <= args.LastLogIndex) {
 			rf.votedFor = args.CandidateId
 			// if election timeout elapses without granting vote to candidate,convert to candidate
 			// so need reset electionTime
@@ -276,6 +276,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
+
 	// if election timeout elapses  without receiving AppendEntries RPC from current leader
 	// need reset electionTimer
 	rf.resetElectionTimer()
@@ -289,51 +290,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	// reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm
-	entry, exist := rf.getByIndex(args.PrevLogIndex)
-	if !exist || entry.Term != args.PrevLogTerm {
-		if !exist {
-			reply.FirstIndex = -1
-		} else {
-			// entry.Term != args.PrevLogTerm
-			conflictTerm := entry.Term
-			j := args.PrevLogIndex
-			for {
-				t, exist := rf.getByIndex(j)
-				if !exist {
-					panic("getByIndex error!")
-				}
-				if t.Term != conflictTerm {
-					break
-				}
-				j--
-			}
-			reply.FirstIndex = j + 1
-		}
-		Debug(dLog2, "S%d firstIndex %d, lenlog = %d,prevLogIndex = %d", rf.me, reply.FirstIndex, len(rf.log), args.PrevLogIndex)
-		reply.Success = false
+	if rf.log.lastIndex() < args.PrevLogIndex {
+		reply.FirstIndex = -1
 		return
 	}
-	reply.Success = true
-	if len(args.Entries) > 0 {
-		oldLogSize := len(rf.log)
-		rf.mergeLog(args.PrevLogIndex+1, args.Entries)
-		if len(rf.log) != oldLogSize {
-			Debug(dClient, "S%d new log = %v", rf.me, rf.log)
+	if rf.log.entry(args.PrevLogIndex).Term != args.PrevLogTerm {
+		// entry.Term != args.PrevLogTerm
+		conflictTerm := rf.log.entry(args.PrevLogIndex).Term
+		j := args.PrevLogIndex
+		for j >= rf.log.start() {
+			t := rf.log.entry(j)
+			if t.Term != conflictTerm {
+				break
+			}
+			j--
 		}
+		reply.FirstIndex = j + 1
+		return
+	}
+
+	reply.Success = true
+
+	if len(args.Entries) > 0 {
+		rf.mergeLog(args.PrevLogIndex+1, args.Entries)
+		Debug(dClient, "S%d new log = %v", rf.me, rf.log)
 	}
 
 	// if leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit,index of last new entry)
+
 	if args.LeaderCommit > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex
-		if args.LeaderCommit >= rf.getLastLogIndex() {
-			rf.commitIndex = rf.getLastLogIndex()
+		if args.LeaderCommit >= rf.log.lastIndex() {
+			rf.commitIndex = rf.log.lastIndex()
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
 		if rf.commitIndex != oldCommitIndex {
-			Debug(dClient, "S%d commitIndex %d -> %d", rf.me, oldCommitIndex, rf.commitIndex)
+			Debug(dLog2, "S%d commitIndex %d -> %d, log = %v", rf.me, oldCommitIndex, rf.commitIndex, rf.log)
 		}
+
 		if rf.commitIndex > rf.lastApplied {
 			rf.applyCond.Signal()
 		}
@@ -404,10 +400,10 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Term:    rf.currentTerm,
 		Command: command,
 	}
-	rf.log = append(rf.log, entry)
+	rf.log.append(entry)
 	rf.persist()
-	term = rf.getLastLogTerm()
-	index = rf.getLastLogIndex()
+	term = rf.currentTerm
+	index = rf.log.lastIndex()
 	Debug(dLeader, "S%d add log %v, index %d", rf.me, entry, index)
 	return
 }
@@ -424,6 +420,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	Debug(dTest, "S%d killed, log = %v", rf.me, rf.log)
 }
 
 func (rf *Raft) killed() bool {
@@ -448,8 +445,8 @@ func (rf *Raft) ticker() {
 		rf.persist()
 		// state
 		term := rf.currentTerm
-		lastLogIndex := rf.getLastLogIndex()
-		lastLogTerm := rf.getLastLogTerm()
+		lastLogIndex := rf.log.lastIndex()
+		lastLogTerm := rf.log.lastEntry().Term
 		voteCnt := 1
 		rf.mu.Unlock()
 		Debug(dVote, "S%d Term %d request vote ", rf.me, term)
@@ -498,7 +495,7 @@ func (rf *Raft) ticker() {
 						rf.resetMatchIndex()
 						rf.resetNextIndex()
 						rf.persist()
-						Debug(dVote, "S%d become leader", rf.me)
+						Debug(dVote, "S%d become leader, log = %v", rf.me, rf.log)
 					}
 				}
 
@@ -530,25 +527,22 @@ func (rf *Raft) heartBeat() {
 			go func() {
 				rf.mu.Lock()
 				args := &AppendEntriesArgs{
-					Term:     term,
-					LeaderId: rf.me,
+					Term:         term,
+					LeaderId:     rf.me,
+					LeaderCommit: rf.commitIndex,
 				}
 				reply := &AppendEntriesReply{}
 
 				//  if last log index >= nextIndex for a follower: send
 				// AppendEntries RPC with log entries starting at nextIndex
-				if rf.getLastLogIndex() >= rf.nextIndex[i] {
-					args.Entries = rf.getFromIndex(rf.nextIndex[i])
-					Debug(dLeader, "S%d send log to S%d, log = %v", rf.me, i, args.Entries)
+				if rf.log.lastIndex() >= rf.nextIndex[i] {
+					t := rf.log.slice(rf.nextIndex[i])
+					args.Entries = make([]Entry, len(t))
+					copy(args.Entries, t)
 				}
 				args.PrevLogIndex = rf.nextIndex[i] - 1
-				entry, exist := rf.getByIndex(args.PrevLogIndex)
-				if !exist {
-					Debug(dLog2, "S%d entry not exist, index = %d, lenlog = %d", rf.me, args.PrevLogIndex, len(rf.log))
-					panic(fmt.Sprintf("S%d entry not exist, index = %d, lenlog = %d", rf.me, args.PrevLogIndex, len(rf.log)))
-				}
-				args.PrevLogTerm = entry.Term
-				args.LeaderCommit = rf.commitIndex
+				args.PrevLogTerm = rf.log.entry(args.PrevLogIndex).Term
+				Debug(dLeader, "S%d send log to S%d, log = %v", rf.me, i, args.Entries)
 
 				rf.mu.Unlock()
 
@@ -598,10 +592,7 @@ func (rf *Raft) heartBeat() {
 								if i == rf.me {
 									continue
 								}
-								entry, exist := rf.getByIndex(N)
-								if !exist {
-									panic("not exist")
-								}
+								entry := rf.log.entry(N)
 								// fix figure-8 5.4.2
 								if entry.Term != rf.currentTerm {
 									break
@@ -627,8 +618,8 @@ func (rf *Raft) heartBeat() {
 
 					if reply.FirstIndex == -1 {
 						j := args.PrevLogIndex
-						for {
-							t, _ := rf.getByIndex(j)
+						for j >= rf.log.start() {
+							t := rf.log.entry(j)
 							if t.Term != args.PrevLogTerm {
 								break
 							}
@@ -655,10 +646,7 @@ func (rf *Raft) applier() {
 			Debug(dLog, "S%d start apply", rf.me)
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
-				entry, exist := rf.getByIndex(rf.lastApplied)
-				if !exist {
-					panic("applier not exist")
-				}
+				entry := rf.log.entry(rf.lastApplied)
 				msg := ApplyMsg{
 					CommandValid: true,
 					Command:      entry.Command,
@@ -695,7 +683,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.role = FOLLOWER
 	rf.votedFor = -1
-	rf.log = []Entry{{Term: 0, Command: nil}}
+	rf.log = mkLogEmpty()
 	rf.heartBeatTime = time.Now()
 	rf.electionTime = time.Now()
 
@@ -729,51 +717,8 @@ func (rf *Raft) resetHeartBeatTimer() {
 	rf.heartBeatTime = time.Now()
 }
 
-func (rf *Raft) getLastLogIndex() int {
-	return len(rf.log) - 1
-}
-
-func (rf *Raft) getLastLogTerm() int {
-	return rf.log[rf.getLastLogIndex()].Term
-}
-
-func (rf *Raft) getByIndex(idx int) (entry Entry, exist bool) {
-	if idx > rf.getLastLogIndex() {
-		return Entry{}, false
-	}
-	return rf.log[idx], true
-}
-
-// get Entries which index >= idx
-func (rf *Raft) getFromIndex(idx int) (res []Entry) {
-	// use res = rf.log[idx:]  data race
-	res = make([]Entry, 0)
-	res = append(res, rf.log[idx:]...)
-	return
-}
-
-// if an existing entry conflict with a new one
-// (same index but different term), delete the existing entry and all that follow it
-// Append any new entries not already in the log
-func (rf *Raft) mergeLog(startIndex int, entries []Entry) {
-	i, j := startIndex, 0
-	for ; j < len(entries); i, j = i+1, j+1 {
-		entry, exist := rf.getByIndex(i)
-		if !exist {
-			rf.log = append(rf.log, entries[j:]...)
-			break
-		}
-		if entry.Term != entries[j].Term {
-			// delete the existing entry and all that follow it
-			rf.log = rf.log[:i]
-			rf.log = append(rf.log, entries[j:]...)
-			break
-		}
-	}
-}
-
 func (rf *Raft) resetNextIndex() {
-	n := rf.getLastLogIndex() + 1
+	n := rf.log.lastIndex() + 1
 	for i := 0; i < len(rf.nextIndex); i++ {
 		if i == rf.me {
 			continue
@@ -789,5 +734,23 @@ func (rf *Raft) resetMatchIndex() {
 			continue
 		}
 		rf.nextIndex[i] = 0
+	}
+}
+
+// if an existing entry conflict with a new one
+// (same index but different term), delete the existing entry and all that follow it
+// Append any new entries not already in the log
+func (rf *Raft) mergeLog(startIndex int, entries []Entry) {
+	i, j := startIndex, 0
+	for ; j < len(entries); i, j = i+1, j+1 {
+		if i <= rf.log.lastIndex() {
+			if rf.log.entry(i).Term == entries[j].Term {
+				continue
+			}
+			rf.log.cutEnd(i)
+			rf.log.append(entries[j])
+		} else {
+			rf.log.append(entries[j])
+		}
 	}
 }
